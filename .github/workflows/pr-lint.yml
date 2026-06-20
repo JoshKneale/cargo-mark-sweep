@@ -1,0 +1,46 @@
+name: PR Lint
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+permissions:
+  pull-requests: read
+jobs:
+  pr-title:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" must start lowercase.
+
+  branch-name:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch name
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          if [[ "$BRANCH" == release-please--* || "$BRANCH" == dependabot/* ]]; then
+            echo "Skipping bot branch: $BRANCH"; exit 0
+          fi
+          if [[ ! "$BRANCH" =~ ^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)/[a-z0-9._-]+$ ]]; then
+            echo "::error::Branch '$BRANCH' must match <type>/<description>, e.g. feat/add-flag, fix/null-deref, ci/bump-x"
+            exit 1
+          fi
+          echo "Branch name OK: $BRANCH"
