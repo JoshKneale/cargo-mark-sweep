@@ -1,5 +1,11 @@
 # cargo-mark-sweep
 
+[![crates.io](https://img.shields.io/crates/v/cargo-mark-sweep.svg)](https://crates.io/crates/cargo-mark-sweep)
+[![downloads](https://img.shields.io/crates/d/cargo-mark-sweep.svg)](https://crates.io/crates/cargo-mark-sweep)
+[![CI](https://github.com/joshkneale/cargo-mark-sweep/actions/workflows/ci.yml/badge.svg)](https://github.com/joshkneale/cargo-mark-sweep/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/cargo-mark-sweep.svg)](#license)
+[![rustc 1.83+](https://img.shields.io/badge/rustc-1.83+-blue.svg)](https://blog.rust-lang.org/)
+
 **A mark-and-sweep garbage collector for cargo's `target/` directory.**
 
 Reclaims the 90%+ of `target/` that cargo will never use again, without touching
