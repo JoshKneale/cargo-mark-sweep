@@ -1,0 +1,19 @@
+[package]
+name = "cargo-mark-sweep"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "A mark-and-sweep garbage collector for cargo's target/ directory: keeps every artifact your build configurations resolve to, deletes the orphaned hash variants cargo never cleans up."
+authors = ["Josh Kneale"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/joshkneale/cargo-mark-sweep"
+homepage = "https://github.com/joshkneale/cargo-mark-sweep"
+keywords = ["cargo", "cache", "gc", "cleanup", "build"]
+categories = ["development-tools::cargo-plugins", "command-line-utilities"]
+exclude = ["/target"]
+
+[dependencies]
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"
