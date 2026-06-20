@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/joshkneale/cargo-mark-sweep"
 homepage = "https://github.com/joshkneale/cargo-mark-sweep"
+documentation = "https://docs.rs/cargo-mark-sweep"
 keywords = ["cargo", "cache", "gc", "cleanup", "build"]
 categories = ["development-tools::cargo-plugins", "command-line-utilities"]
 exclude = ["/target"]
