@@ -404,6 +404,7 @@ pub fn run(args: DaemonArgs) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn print_state() {
     let state = State::load();
     if state.workspaces.is_empty() {
