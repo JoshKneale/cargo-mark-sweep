@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -75,16 +76,26 @@ pub fn target_directory(root: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn entry_size(path: &Path) -> u64 {
+    entry_size_seen(path, &mut HashSet::new())
+}
+
+/// Bytes under `path`, counting each inode at most once across the whole walk.
+/// cargo hardlinks artifacts heavily (two thirds of a large `deps/` is links),
+/// so summing every entry's length reports ~1.8x the space a delete can free.
+pub fn entry_size_seen(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return 0;
     };
     if !meta.is_dir() {
+        if meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino())) {
+            return 0;
+        }
         return meta.len();
     }
     let mut total = 0;
     if let Ok(rd) = fs::read_dir(path) {
         for e in rd.flatten() {
-            total += entry_size(&e.path());
+            total += entry_size_seen(&e.path(), seen);
         }
     }
     total
@@ -158,6 +169,7 @@ fn is_structural(stderr: &str) -> bool {
         "Unrecognized option",
         "no such subcommand",
         "is unstable",
+        "only accepted on the nightly channel",
     ];
     PATTERNS.iter().any(|p| stderr.contains(p))
 }
@@ -227,7 +239,12 @@ struct SweepStats {
     errors: usize,
 }
 
-fn sweep_dir(dir: &Path, live: &HashSet<String>, dry_run: bool) -> SweepStats {
+fn sweep_dir(
+    dir: &Path,
+    live: &HashSet<String>,
+    dry_run: bool,
+    seen: &mut HashSet<(u64, u64)>,
+) -> SweepStats {
     let mut st = SweepStats {
         live: 0,
         orphan: 0,
@@ -240,7 +257,7 @@ fn sweep_dir(dir: &Path, live: &HashSet<String>, dry_run: bool) -> SweepStats {
     for entry in rd.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let size = entry_size(&path);
+        let size = entry_size_seen(&path, seen);
         match first_hash(&name) {
             Some(h) if !live.contains(h) => {
                 st.orphan += size;
@@ -319,10 +336,11 @@ pub fn run(opts: &Options) -> Result<Outcome, String> {
     eprintln!("\n== Sweep{mode} ==");
     let mut freed: u64 = 0;
     let mut errors = 0;
+    let mut seen = HashSet::new();
     for profile in &profiles {
         let pdir = target.join(profile);
         for sub in ["deps", "build"] {
-            let st = sweep_dir(&pdir.join(sub), &live, opts.dry_run);
+            let st = sweep_dir(&pdir.join(sub), &live, opts.dry_run, &mut seen);
             freed += st.orphan;
             errors += st.errors;
             eprintln!(
@@ -339,7 +357,7 @@ pub fn run(opts: &Options) -> Result<Outcome, String> {
         }
         let incr = pdir.join("incremental");
         if incr.is_dir() {
-            let size = entry_size(&incr);
+            let size = entry_size_seen(&incr, &mut seen);
             if opts.keep_incremental {
                 eprintln!("  {profile}/incremental: {} (kept)", gb(size));
             } else {
@@ -410,6 +428,30 @@ mod tests {
         assert!(!is_structural(
             "did not match any packages\nerror[E0001]: x"
         ));
+        assert!(is_structural(
+            "error: the `-Z` flag is only accepted on the nightly channel of Cargo, but this is the `stable` channel"
+        ));
+        assert!(!is_structural(
+            "error: the `-Z` flag is only accepted on the nightly channel\nerror[E0433]: x"
+        ));
+    }
+
+    #[test]
+    fn hardlinks_counted_once() {
+        let dir = std::env::temp_dir().join(format!("cms-size-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.rlib"), vec![0u8; 4096]).unwrap();
+        fs::hard_link(dir.join("a.rlib"), dir.join("b.rlib")).unwrap();
+        fs::write(dir.join("c.rlib"), vec![0u8; 1024]).unwrap();
+
+        assert_eq!(entry_size(&dir), 4096 + 1024);
+
+        let mut seen = HashSet::new();
+        assert_eq!(entry_size_seen(&dir.join("a.rlib"), &mut seen), 4096);
+        assert_eq!(entry_size_seen(&dir.join("b.rlib"), &mut seen), 0);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
