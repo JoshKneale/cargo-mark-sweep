@@ -158,6 +158,24 @@ fn normalize(cmdline: &str) -> Option<String> {
         if a == "-q" || a == "--quiet" {
             continue;
         }
+        // rust-analyzer mints a fresh temp lockfile path per run, so keeping it
+        // stores every observation as a distinct config and exhausts the set.
+        if a == "--lockfile-path" {
+            it.next();
+            continue;
+        }
+        if a.starts_with("--lockfile-path=") {
+            continue;
+        }
+        // Nightly-only: cargo on stable rejects the whole invocation. Dropping
+        // --compile-time-deps widens what gets marked, which is what we want.
+        if a == "-Z" {
+            it.next();
+            continue;
+        }
+        if a.starts_with("-Z") || a == "--compile-time-deps" {
+            continue;
+        }
         if a == "--no-run" && forced.contains(&"--no-run") {
             continue;
         }
@@ -508,6 +526,40 @@ mod tests {
             normalize("cargo check --message-format json-diagnostic-rendered-ansi"),
             Some("check".into())
         );
+    }
+
+    #[test]
+    fn strips_ephemeral_and_nightly_flags() {
+        assert_eq!(
+            normalize(
+                "/Users/x/.cargo/bin/cargo check --workspace --manifest-path /w/Cargo.toml \
+                 --lockfile-path /var/folders/1x/T/rust-analyzer9bf-8e/Cargo.lock --all-features \
+                 --keep-going --compile-time-deps --all-targets -Zunstable-options"
+            ),
+            Some(
+                "check --workspace --manifest-path /w/Cargo.toml --all-features --keep-going \
+                 --all-targets"
+                    .into()
+            )
+        );
+        assert_eq!(
+            normalize("cargo check --lockfile-path=/tmp/ra-1/Cargo.lock -Z unstable-options"),
+            Some("check".into())
+        );
+    }
+
+    #[test]
+    fn rust_analyzer_runs_dedupe_to_one_config() {
+        let a = normalize(
+            "cargo check --workspace --lockfile-path /var/T/rust-analyzer9bf-8e/Cargo.lock \
+             --all-targets -Zunstable-options",
+        );
+        let b = normalize(
+            "cargo check --workspace --lockfile-path /var/T/rust-analyzer9bf-b4/Cargo.lock \
+             --all-targets -Zunstable-options",
+        );
+        assert_eq!(a, b);
+        assert_eq!(a, Some("check --workspace --all-targets".into()));
     }
 
     #[test]

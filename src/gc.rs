@@ -158,6 +158,7 @@ fn is_structural(stderr: &str) -> bool {
         "Unrecognized option",
         "no such subcommand",
         "is unstable",
+        "only accepted on the nightly channel",
     ];
     PATTERNS.iter().any(|p| stderr.contains(p))
 }
@@ -409,6 +410,12 @@ mod tests {
         ));
         assert!(!is_structural(
             "did not match any packages\nerror[E0001]: x"
+        ));
+        assert!(is_structural(
+            "error: the `-Z` flag is only accepted on the nightly channel of Cargo, but this is the `stable` channel"
+        ));
+        assert!(!is_structural(
+            "error: the `-Z` flag is only accepted on the nightly channel\nerror[E0433]: x"
         ));
     }
 
