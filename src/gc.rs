@@ -265,6 +265,63 @@ fn mark_one(root: &Path, cmd: &str, live_paths: &mut Vec<String>) -> Result<Mark
     Ok(Mark::Ok)
 }
 
+/// Tracks which inodes a sweep removes links to, so `freed` can mean bytes the
+/// filesystem actually gets back rather than bytes the deleted paths occupied.
+///
+/// Deleting one link to a multiply-linked inode frees nothing — the data lives
+/// until the last link goes, and cargo hardlinks artifacts to places outside the
+/// swept dirs (uplifted binaries in `target/<profile>/`). Occupancy and reclaim
+/// therefore differ, and only reclaim is worth reporting as freed.
+#[derive(Default)]
+struct LinkLedger {
+    /// (dev, ino) -> (size, links on disk, links this sweep removes)
+    inodes: std::collections::HashMap<(u64, u64), (u64, u64, u64)>,
+}
+
+impl LinkLedger {
+    /// Record every regular file under `path` as about to be unlinked.
+    fn record(&mut self, path: &Path) {
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if meta.is_dir() {
+            if let Ok(rd) = fs::read_dir(path) {
+                for e in rd.flatten() {
+                    self.record(&e.path());
+                }
+            }
+            return;
+        }
+        let slot =
+            self.inodes
+                .entry((meta.dev(), meta.ino()))
+                .or_insert((meta.len(), meta.nlink(), 0));
+        slot.2 += 1;
+    }
+
+    /// Bytes released: an inode counts only once every link to it is gone.
+    fn reclaimed(&self) -> u64 {
+        self.inodes
+            .values()
+            .filter(|(_, nlink, removed)| removed >= nlink)
+            .map(|(size, _, _)| size)
+            .sum()
+    }
+}
+
+/// Free bytes on the filesystem holding `path`, for corroborating `reclaimed()`
+/// against what the filesystem actually reports.
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    Some(s.f_bavail as u64 * s.f_bsize as u64)
+}
+
 struct SweepStats {
     live: u64,
     orphan: u64,
@@ -277,6 +334,7 @@ fn sweep_dir(
     live: &HashSet<String>,
     dry_run: bool,
     seen: &mut HashSet<(u64, u64)>,
+    ledger: &mut LinkLedger,
 ) -> SweepStats {
     let mut st = SweepStats {
         live: 0,
@@ -294,6 +352,7 @@ fn sweep_dir(
         match first_hash(&name) {
             Some(h) if !live.contains(h) => {
                 st.orphan += size;
+                ledger.record(&path);
                 if dry_run {
                     st.removed += 1;
                     continue;
@@ -367,14 +426,14 @@ pub fn run(opts: &Options) -> Result<Outcome, RunError> {
 
     let mode = if opts.dry_run { " (dry run)" } else { "" };
     eprintln!("\n== Sweep{mode} ==");
-    let mut freed: u64 = 0;
     let mut errors = 0;
     let mut seen = HashSet::new();
+    let mut ledger = LinkLedger::default();
+    let free_before = free_bytes(&target);
     for profile in &profiles {
         let pdir = target.join(profile);
         for sub in ["deps", "build"] {
-            let st = sweep_dir(&pdir.join(sub), &live, opts.dry_run, &mut seen);
-            freed += st.orphan;
+            let st = sweep_dir(&pdir.join(sub), &live, opts.dry_run, &mut seen, &mut ledger);
             errors += st.errors;
             eprintln!(
                 "  {profile}/{sub}: live {}, orphan {} ({} entries{})",
@@ -394,18 +453,19 @@ pub fn run(opts: &Options) -> Result<Outcome, RunError> {
             if opts.keep_incremental {
                 eprintln!("  {profile}/incremental: {} (kept)", gb(size));
             } else {
+                ledger.record(&incr);
                 if !opts.dry_run {
                     if let Err(e) = fs::remove_dir_all(&incr) {
                         eprintln!("    failed to remove {}: {e}", incr.display());
                         errors += 1;
                     }
                 }
-                freed += size;
                 eprintln!("  {profile}/incremental: {} wiped", gb(size));
             }
         }
     }
     drop(locks);
+    let freed = ledger.reclaimed();
     eprintln!(
         "\n  {} {}",
         if opts.dry_run {
@@ -415,8 +475,13 @@ pub fn run(opts: &Options) -> Result<Outcome, RunError> {
         },
         gb(freed)
     );
-
     if !opts.dry_run {
+        // Corroborate against the filesystem while the tree is still untouched —
+        // the shakedown below rebuilds and would muddy the delta.
+        if let (Some(before), Some(after)) = (free_before, free_bytes(&target)) {
+            eprintln!("  filesystem freed: {}", gb(after.saturating_sub(before)));
+        }
+
         // Shakedown: prove the live set still builds; first build after a sweep
         // may recompile a handful of workspace units.
         eprintln!("\n== Shakedown ==");
@@ -484,6 +549,31 @@ mod tests {
             "error: the `-Z` flag is only accepted on the nightly channel of Cargo"
         ));
         assert!(!is_compile_error("error: no such subcommand: `frobnicate`"));
+    }
+
+    #[test]
+    fn reclaim_credits_only_fully_unlinked_inodes() {
+        let dir = std::env::temp_dir().join(format!("cms-reclaim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let doomed = dir.join("doomed");
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir_all(&doomed).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+
+        // Both links inside the swept set: the data really goes.
+        fs::write(doomed.join("a.rlib"), vec![0u8; 4096]).unwrap();
+        fs::hard_link(doomed.join("a.rlib"), doomed.join("b.rlib")).unwrap();
+        // Sole link: goes.
+        fs::write(doomed.join("c.rlib"), vec![0u8; 1024]).unwrap();
+        // Uplifted-style link surviving outside the swept set: frees nothing.
+        fs::write(doomed.join("d.rlib"), vec![0u8; 8192]).unwrap();
+        fs::hard_link(doomed.join("d.rlib"), elsewhere.join("d")).unwrap();
+
+        let mut ledger = LinkLedger::default();
+        ledger.record(&doomed);
+        assert_eq!(ledger.reclaimed(), 4096 + 1024);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
