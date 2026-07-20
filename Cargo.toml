@@ -1,6 +1,6 @@
 [package]
 name = "cargo-mark-sweep"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.83"
 description = "A mark-and-sweep garbage collector for cargo's target/ directory: keeps every artifact your build configurations resolve to, deletes the orphaned hash variants cargo never cleans up."
