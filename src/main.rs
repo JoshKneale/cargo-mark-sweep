@@ -59,7 +59,7 @@ fn one_shot(argv: &[String]) -> Result<(), String> {
     if opts.cmds.is_empty() {
         opts.cmds = gc::DEFAULT_CMDS.iter().map(|s| s.to_string()).collect();
     }
-    gc::run(&opts).map(|_| ())
+    gc::run(&opts).map(|_| ()).map_err(|e| e.message)
 }
 
 fn daemon_args(argv: &[String]) -> daemon::DaemonArgs {

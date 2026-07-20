@@ -14,6 +14,10 @@ const RETRY_BACKOFF_SECS: u64 = 60 * 60;
 const ACTIVE_POLL: Duration = Duration::from_secs(5);
 const IDLE_POLL: Duration = Duration::from_secs(30);
 const MAX_LEARNED_CMDS: usize = 8;
+/// Consecutive unclassifiable mark failures before a config is retired. Compile
+/// errors never count, so this only fires on a config cargo keeps rejecting for
+/// a reason `is_structural` does not recognise.
+const MAX_CONFIG_FAILURES: u32 = 3;
 
 /// Coverage breadth of a mark config; higher subsumes lower. At cap, the
 /// narrowest config is evicted so broad workspace marks (which reach the most
@@ -66,6 +70,10 @@ pub struct Workspace {
     pub last_opportunistic: u64,
     #[serde(default)]
     pub dirty: bool,
+    /// Consecutive unclassifiable mark failures per config; cleared by any
+    /// successful sweep.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fails: BTreeMap<String, u32>,
 }
 
 fn home() -> PathBuf {
@@ -344,8 +352,10 @@ fn sweep_pass(state: &mut State, dry_run: bool, threshold: u64, force: bool, dee
                 ws.dirty = false;
                 ws.last_sweep = now();
                 ws.last_freed = out.freed;
+                ws.fails.clear();
                 for dead in &out.dead_cmds {
                     ws.cmds.retain(|c| c != dead);
+                    ws.fails.remove(dead);
                     log(&format!("{root}: pruned invalid config `cargo {dead}`"));
                 }
                 log(&format!(
@@ -354,9 +364,23 @@ fn sweep_pass(state: &mut State, dry_run: bool, threshold: u64, force: bool, dee
                     gc::gb(out.freed)
                 ));
             }
-            Err(e) => log(&format!(
-                "{root}: sweep failed, will retry next window: {e}"
-            )),
+            Err(e) => {
+                log(&format!(
+                    "{root}: sweep failed, will retry next window: {}",
+                    e.message
+                ));
+                if let Some(cmd) = e.suspect_cmd {
+                    let n = ws.fails.entry(cmd.clone()).or_insert(0);
+                    *n += 1;
+                    if *n >= MAX_CONFIG_FAILURES {
+                        ws.cmds.retain(|c| c != &cmd);
+                        ws.fails.remove(&cmd);
+                        log(&format!(
+                            "{root}: retired config `cargo {cmd}` after {MAX_CONFIG_FAILURES} unclassifiable failures"
+                        ));
+                    }
+                }
+            }
         }
     }
     if let Err(e) = state.save() {
