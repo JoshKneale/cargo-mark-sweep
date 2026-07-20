@@ -24,6 +24,30 @@ pub struct Outcome {
     pub dead_cmds: Vec<String>,
 }
 
+pub struct RunError {
+    pub message: String,
+    /// Config that aborted the sweep when cargo's failure was neither structural
+    /// nor a recognisable compile error. A compile error is transient (the tree
+    /// is mid-edit) and must never count against a config; an unclassifiable
+    /// failure may be a config that can no longer work, so the daemon counts it.
+    pub suspect_cmd: Option<String>,
+}
+
+impl From<String> for RunError {
+    fn from(message: String) -> Self {
+        RunError {
+            message,
+            suspect_cmd: None,
+        }
+    }
+}
+
+impl From<&str> for RunError {
+    fn from(message: &str) -> Self {
+        RunError::from(message.to_string())
+    }
+}
+
 pub fn gb(bytes: u64) -> String {
     format!("{:.2} GB", bytes as f64 / 1e9)
 }
@@ -153,11 +177,17 @@ enum Mark {
     Dead(String),
 }
 
+/// cargo reached compilation and a real package failed: the tree is broken, not
+/// the config. Always transient — never counts against a config.
+fn is_compile_error(stderr: &str) -> bool {
+    stderr.contains("error[E") || stderr.contains("could not compile")
+}
+
 /// A non-zero cargo exit is "structural" — the config itself is unusable — only
 /// when cargo never reached compilation. A real compile error (`error[E…]` /
 /// `could not compile`) means the tree is broken: keep the config, abort.
 fn is_structural(stderr: &str) -> bool {
-    if stderr.contains("error[E") || stderr.contains("could not compile") {
+    if is_compile_error(stderr) {
         return false;
     }
     const PATTERNS: &[&str] = &[
@@ -176,7 +206,7 @@ fn is_structural(stderr: &str) -> bool {
 
 /// Run one cargo command with JSON messages; collect live paths. Aborts on
 /// command failure with stderr shown (a failed mark must never lead to a sweep).
-fn mark_one(root: &Path, cmd: &str, live_paths: &mut Vec<String>) -> Result<Mark, String> {
+fn mark_one(root: &Path, cmd: &str, live_paths: &mut Vec<String>) -> Result<Mark, RunError> {
     eprintln!("  marking: cargo {cmd}");
     let mut child = Command::new("cargo")
         .args(cmd.split_whitespace())
@@ -224,10 +254,13 @@ fn mark_one(root: &Path, cmd: &str, live_paths: &mut Vec<String>) -> Result<Mark
                 .trim();
             return Ok(Mark::Dead(format!("`cargo {cmd}`: {detail}")));
         }
-        return Err(format!(
-            "`cargo {cmd}` failed ({}); aborting before any sweep.\n{stderr}",
-            out.status
-        ));
+        return Err(RunError {
+            message: format!(
+                "`cargo {cmd}` failed ({}); aborting before any sweep.\n{stderr}",
+                out.status
+            ),
+            suspect_cmd: (!is_compile_error(&stderr)).then(|| cmd.to_string()),
+        });
     }
     Ok(Mark::Ok)
 }
@@ -284,7 +317,7 @@ fn sweep_dir(
     st
 }
 
-pub fn run(opts: &Options) -> Result<Outcome, String> {
+pub fn run(opts: &Options) -> Result<Outcome, RunError> {
     let target = target_directory(&opts.root)?;
 
     eprintln!("== Mark ==");
@@ -397,14 +430,15 @@ pub fn run(opts: &Options) -> Result<Outcome, String> {
             Ok(s) => {
                 return Err(format!(
                     "shakedown `cargo {first}` failed ({s}) — investigate before trusting this sweep"
-                ));
+                )
+                .into());
             }
-            Err(e) => return Err(format!("failed to run shakedown: {e}")),
+            Err(e) => return Err(format!("failed to run shakedown: {e}").into()),
         }
     }
 
     if errors > 0 {
-        return Err(format!("{errors} removal errors"));
+        return Err(format!("{errors} removal errors").into());
     }
     Ok(Outcome { freed, dead_cmds })
 }
@@ -434,6 +468,22 @@ mod tests {
         assert!(!is_structural(
             "error: the `-Z` flag is only accepted on the nightly channel\nerror[E0433]: x"
         ));
+    }
+
+    #[test]
+    fn only_compile_errors_are_transient() {
+        assert!(is_compile_error(
+            "error[E0433]: failed to resolve: could not find `X`"
+        ));
+        assert!(is_compile_error(
+            "error: could not compile `engine` due to 1 previous error"
+        ));
+        // A broken tree must never count against a config, or a long mid-edit
+        // window would retire good configs.
+        assert!(!is_compile_error(
+            "error: the `-Z` flag is only accepted on the nightly channel of Cargo"
+        ));
+        assert!(!is_compile_error("error: no such subcommand: `frobnicate`"));
     }
 
     #[test]
